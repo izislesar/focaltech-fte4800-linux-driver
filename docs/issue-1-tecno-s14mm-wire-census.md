@@ -1,151 +1,151 @@
-# Issue #1 wire census — Tecno MegaBook S14 (FTE4800, chip-id 0xFFFF)
+# Issue #1 wire census v2 — Tecno MegaBook S14 (FTE4800, chip-id 0xFFFF)
 
-Complete, reproducible evidence package collected on the reporter's hardware:
+This is the corrected census (v2). The first evidence package collected in
+this document's predecessor used a helper whose RX offsets did not match the
+kernel's shared-offset semantics (`focal_raw_xfer()` advances one offset by
+each step's len; the old helper returned `rx[:n]`, which prefixed seven
+stale bytes and shifted the data window). The probe
+(`tools/fte4800_wire_probe.py`) now mirrors the kernel exactly, and
+`tests/test_wire_probe_accounting.py` locks that behavior down with unit
+tests on payload alignment and clock counts.
 
     Machine:      TECNO MegaBook S14 (S14MM SKU), Core Ultra 9 185H, Arch Linux
-    Kernel:       7.2.9-arch1-1 (v7.2.8-1 at report time)
+    Kernel:       7.2.9-arch1-1
     ACPI device:  \_SB.PC02.SPI1.FPNT (_ADR 0x001E0003 = PCI 00:1e.3),
                   enumerated by Linux as pxa2xx-spi.2 / spi-FTE4800:00
-    Driver:       focal_spi DKMS v1.0.3, source identical to git main
-                  (md5 4303a10024ac718f0f6746d4aa388efd), SRCVERSION 0B82973762AB252FA2D5FC6
+    Driver:       focal_spi DKMS v1.0.3, source md5-identical to git main
     Selftest:     reset PASS; identity always 0xFFFF; RESULT: FAIL
+                  (verified on the issue/tecno-wake-diagnostic branch, 0742fce)
 
-All tool output quoted below is reproducible with `tools/fte4800_wire_probe.py`.
+## 1. Verified working (unchanged from v1)
 
-## 1. What is already verified working
+* ACPI/DSDT: `FPTT == 0x07` -> HID `FTE4800`; `FPTM == 0` -> `_CRS` =
+  SpiSerialBus (mode 0, 1 MHz) + one GpioIo reset pad + GpioInt
+  (Edge, ActiveHigh) -> IRQ 66 rising edge. Kernel binding matches:
+  `ready: mode=0 speed=1000000Hz bits=8 irq=66 reset=active-high`;
+  `gpio-208 (GPP_B_4) out hi` claimed by `spi-FTE4800:00`.
+* **The reset pad physically controls the sensor.** Reset A/B test (§2 [1]):
+  the MISO line behavior differs between reset-asserted and released states.
 
-* ACPI/DSDT configuration is complete and matches the template used by the
-  working Infinix ZERO BOOK 13 path:
-  * `FPTT == 0x07` -> HID `FTE4800` (confirmed live, modalias `acpi:FTE4800`)
-  * `FPTM == 0` -> `_CRS = SPIM(SPIX=0x07, mode 0, 0x000F4240 Hz) + BBUF + GBUF`
-    i.e. exactly 1 MHz, mode 0, one GpioIo reset pad, one GpioInt; no extra
-    GpioIo (UBUF) resource present.
-  * Reset pad `\ PullUp`/IoRestrictionOutputOnly, GpioInt Edge/ActiveHigh.
-* The kernel bound it as claimed:
-  * `focal-fte4800 : ready: mode=0 speed=1000000Hz bits=8 irq=66 reset=active-high`
-  * debugfs gpio: `gpio-208 (GPP_B_4) spi-FTE4800:00 out hi` — the reset pad
-    **is** claimed and actively driven HIGH.
-  * IRQ 66 is the correct GpioInt route (`INUM(GFPI) & 0x7F == 66`), requested
-    as rising edge — consistent with `GpioInt (Edge, ActiveHigh, ...)`.
-* The reset pad demonstrably **physically controls the sensor** (see §2, A/B test).
+## 2. Wire census (corrected probe)
 
-## 2. Wire census results (IOCTL_RAW_XFER)
+### [1] Reset A/B test (full-duplex 32 B @1 MHz, payload window)
 
-### [1] Reset A/B test — the sensor is attached and alive
-
-| State | Identity read (32 B, full-duplex) |
+| State | payload census |
 |---|---|
-| Reset pad asserted LOW | `ff ff ff ff ... ff` (all FF) |
-| Reset pad released HIGH | `00×20 xx ff×11` (MISO clamped LOW, then released) |
+| Reset pad asserted LOW | `00×9 ff×23` |
+| Reset pad released HIGH | `00×9 xx ff×22` |
 
-With reset LOW the sensor never drives MISO (pure pull-up level). After
-release it clamps MISO LOW at the next CS assert. This proves the ACPI reset
-pad reaches the sensor; the driver's reset handling is correct.
+With the pad LOW the line is still clamped low for ~9 bytes before floating
+high — so the sensor (or its MISO pad) shows *some* activity even while held
+in reset, and a *longer* clamp (~17-18 bytes) once released. This is direct
+evidence that the reset pad toggling reaches the sensor side of the bus.
 
-### [3]/[4] Mode and speed sweep — the "reply" is a line-level artifact, not data
+### [10] Window-length sweep — the clamp is byte-aligned, not time-based
 
-Transition point of MISO LOW→HIGH vs SPI clock (mode 0, write-then-read):
+Write-then-read @1 MHz, zero-prefix length vs requested window n:
 
-| Clock | zeros before release | elapsed time while LOW |
-|---|---|---|
-| 100 kHz | 8 B | ~80 µs |
-| 250 kHz | 11 B | ~44 µs |
-| 500 kHz | 16 B | ~32 µs |
-| 1 MHz | 26 B | ~26 µs |
-| 2 MHz | 32 B (whole read) | ≥16 µs |
-| 4 MHz | 32 B | ≥8 µs |
-| 8 MHz | 32 B | ≥4 µs |
+| n | zero-prefix |
+|---|---|
+| 2, 4, 6, 8, 12, 16 | n (window ends inside the clamp) |
+| 17, 18, 20, 24 | 17 |
+| 32, 48, 64 | 17-18 (jitter ±1, single ramp byte) |
 
-* SPI mode (0/1/2/3) does not change the pattern (a real framing mismatch
-  would).
-* The release point is roughly constant **in time**, not in bytes, and the
-  release edge itself is a slow RC ramp (partial-byte masks 01/03/07/0F/1F/7F
-  observed across reads): classic "driven low, then left high-Z with a weak
-  pull-up".
-* Reads of different addresses (identity 0x9180, image 0x9080, ROM 0x0090,
-  2 B / 32 B / 5120 B) produce byte-for-byte the same census → the sensor
-  never parses the 7-byte command header.
-* Repeated reads after the first post-reset read return pure FF: the clamp is
-  a one-shot behavior tied to reset release, not a per-transfer response.
-* Deep reads (5120 B) contain exactly the same ~20 zeros + FF tail — no data
-  anywhere in a 5120-byte window.
+The clamp saturates at ~17-18 bytes and is independent of the requested
+length. Combined with §[4] below (identical prefix at 100 kHz - 8 MHz), the
+release is tied to the clock, i.e. a device-side state machine, not an RC
+ramp.
+
+### [3]/[4] Mode and speed sweep
+
+Zero-prefix is ~17 bytes for every SPI mode (0-3) and every clock from
+100 kHz to 8 MHz. A framing mismatch would change the pattern with mode;
+an RC artifact would track time. Neither happens — the response is a fixed
+byte-count of actively driven LOW, then hi-Z with a slow pull-up release.
+
+### [2] Framing sweep
+
+Same shape for write-then-read (two CS windows) and full-duplex (one CS
+window, 7+n clocks): the clamp starts at each CS-assert and lasts ~17-18
+clock bytes. The 7 header-position bytes of the full-duplex capture are also
+LOW — the sensor clamps MISO while the header is being clocked in.
 
 ### [5] ROM-state ID probe
 
-`SPI0_Read(0x90)` never returns the documented ROM bootloader ID `0x56A2`
-(only the line-level artifact). The sensor is therefore not in the
-normal ROM state either.
+`read(0x0090)` (2 B write-then-read and 32 B full-duplex) never returns the
+documented ROM bootloader ID `0x56A2`; only the fixed clamp pattern.
 
-### [6] Vendor recovery sequences — no effect
+### [6] Vendor wake / sync variants
 
-The known vendor sequences were applied before identity reads, none produced
-application-mode behavior:
+`FF 00 00 00` wake after reset (+5 ms), wake *while* the reset pad is LOW
+then release (+5 ms / +350 ms), and `CMD_Set(0x55)` with 10/20/50/100/200/
+300/500 ms waits before the identity read: all produce the identical clamp
+pattern. The opt-in `--wake-probe` from 0742fce remains FAIL on this
+machine. No recovery sequence changes the wire behavior.
 
-* `SPI0_Wakeup` pattern `FF 00 00 00` after reset (+5 ms) — unchanged.
-* `FF 00 00 00` written *while the reset pad is LOW*, then release
-  (+5 ms / +350 ms) — unchanged.
-* `CMD_Set(0x55)` = `70 55 AA` boot sync, waits 10…500 ms — unchanged.
+### [8] Bulk-response profile (5120 B)
 
-So the `FT9368.py`-only wake sequence cannot explain the failure either;
-the opt-in `--wake-probe` in commit 0742fce still reports FAIL on this
-machine.
+Deep reads of `0x9180` and `0x9080` and the full triggered-capture sequence
+(`SFR 0x3B=1`, 60 ms integration, bulk `0x9080`): every 5120-byte payload is
+`00×~10 xx ff×~5110`. No data anywhere in a 5120-byte window, for any
+address, before or after the SFR trigger.
 
-### [9] IRQ census
+### [9] IRQ census — the sensor signals once per reset release
 
-The GpioInt (rising edge, IRQ 66) fires **never** — including across several
-power-off/power-on cycles and an 8-second observation window
-(`/proc/interrupts` count stays 0; baseline was also 0 for the whole syslog
-since module load in a pristine boot). Even if SPI data were missing, a
-booting FT9368 would be expected to signal attention through IRQ at least
-once. Consistent with a chip that never leaves reset/pre-boot state.
+With the IRQ enabled (`IOCTL_IRQ_ENABLE(1)`), `/proc/interrupts` summed over
+all CPUs (v1 counted only the first CPU and reported 0 — wrong):
+
+```
+IRQ count 1 -> 2, 2 -> 3, 3 -> 4, 4 -> 5   (one edge per pad release)
+```
+
+An isolated check confirms: no edges while idle, none while the pad is held
+LOW, exactly one rising edge after each release. Two readings are possible:
+
+* the sensor raises its attention line at the end of a (failed) boot attempt,
+* or the edge is an electrical artifact of the pad-release transition.
+
+Either way the line is wired and observed by the kernel.
 
 ## 3. Interpretation
 
-The device binding, ACPI resources, reset polarity, SPI mode/speed and IRQ
-route are all correct and identical in shape to the working reference board.
-On the wire, the FTE4800:
+Corrected model of the sensor's wire behavior:
 
-1. is physically attached (reset pad toggling changes MISO level),
-2. never produces a single command-shaped response,
-3. does not parse the protocol framing used by the healthy FT9368,
-4. never raises its interrupt.
+1. attached, reset control works (pad state changes line behavior),
+2. IRQ line wired and observed, exactly one edge per reset release,
+3. SPI response engine: from each CS-assert, MISO is actively driven LOW
+   for ~17-18 clock bytes (9 when held in reset), then released hi-Z with a
+   slow pull-up charge — invariant across modes 0-3, 100 kHz - 8 MHz, every
+   address (0x9180 / 0x9080 / 0x0090), every framing, and every vendor
+   recovery sequence; no address- or command-dependent content anywhere,
+4. never returns a valid identity (chip@0x13 = 0xFFFF in every sample).
 
-The remaining explanations, in order of likelihood:
+The byte-aligned, clock-tracking clamp is a *device-side* behavior, not a
+passive-line artifact. The remaining explanations:
 
-* **H1 — board/SKU-level power or strap.** The S14MM fingerprint module may
-  lack or have disabled its 3.3 V rail / a strapping pin, so the MCU never
-  executes flash or ROM code. (Consistent with: correct line-level artifact
-  behavior + zero command parsing + zero IRQ.)
-* **H2 — flex/connector fault on this unit.** Same observable signature.
-* **H3 — this SKU ships a different FocalTech sensor family** that needs the
-  vendor PRAMBOOT firmware download sequence (registers 0x09/0x10/0x61,
-  poll 0x6A, 0xAB/0xBF download loop) which the Linux stack never requires
-  (it is not ported because Infinix flash-boots). The ROM handshake failed
-  earlier than the identity read (no 0x56A2), so this cannot yet be started
-  from the current transport.
-
-Distinguishing H3 from H1/H2 requires either the vendor's Tecno S14 Windows
-driver behaviour on the same unit (does Windows fingerprint enroll work?) or
-a logic analyser on the flex (are MISO bytes actually driven low by the
-sensor pad or by a level shifter / pull-down).
+* **H1 — SKU/board-level power or strap.** The S14MM fingerprint module may
+  be missing its rail or be strapped for a different boot path, leaving the
+  MCU in a non-communicating state (fixed clamp + boot-attention IRQ).
+* **H2 — flex/connector fault on this specific unit.** Same signature.
+* **H3 — different FocalTech sensor variant on this SKU** that requires the
+  vendor PRAMBOOT firmware download handshake (CMD_Set(0x55) sync, ROM ID
+  `0x56A2` gate, 0x09/0x10/0x61 config, 0x6A poll, 0xAB/0xBF download loop).
+  The gate never opens here (no `0x56A2`), so the handshake cannot start
+  from the current transport, and the identical clamp pattern across all
+  known commands does not support a framing bug on our side.
 
 ## 4. How to reproduce
 
-    sudo python3 tools/fte4800_wire_probe.py 2>&1 | tee wire-census.log
+    sudo python3 tools/fte4800_wire_probe.py 2>&1 | tee wire-census-v2.log
 
-Attach: `wire-census.log`, `dmesg-current.log`,
-selftest `wake-probe.log`, and (if available) a decompiled DSDT excerpt for
-`\_SB.PC02.SPI1.FPNT`.
+## 5. Next steps
 
-## 5. Suggested next steps
-
-1. Confirm Windows behaviour on the same SKU (did the fingerprint work in
-   Windows on this machine before Arch was installed?). This is the highest
-   -value single data point for H1 vs H3.
-2. Loan/pass through controller debug: capture the SPI pads with a scope
-   around the ~30 µs MISO-low pulse and confirm whether the pulse comes from
-   the sensor pad (H1/H2) or from a stuck driver (H3-start).
-3. Optionally: port the PRAMBOOT handshake from the Windows driver RE
-   (boot-loader sequence, `SPI0_Read(0x90) == 0x56A2` gate) into
-   `tools/ft9368.py` as an opt-in `--pramboot` probe; safe because the
-   current transport never reaches that code path on flash-booted devices.
+1. Windows behaviour on the same unit (did fingerprint enroll work in
+   Windows before Arch was installed?) — splits H1/H2 from H3.
+2. Logic analyser on the flex: confirm the ~17-18-byte LOW clamp is driven
+   by the sensor pad (H1/H2) and check whether any clock edge count other
+   than ~17-18*8 ever appears.
+3. If H3 is desired to be tested further, port the PRAMBOOT handshake from
+   the Windows RE into `tools/ft9368.py` as an opt-in `--pramboot` probe;
+   note the `0x56A2` gate has never opened on this machine, so a successful
+   port would still likely need the vendor's exact ROM-state entry sequence.
